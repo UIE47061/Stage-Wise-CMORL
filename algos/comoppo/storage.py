@@ -20,8 +20,16 @@ class ReplayBuffer:
             reward_dim:int,
             cost_dim:int,
             obs_sym_mat:torch.Tensor,
-            state_sym_mat:torch.Tensor) -> None:
+            state_sym_mat:torch.Tensor,
+            reward_mode: str = 'legacy',
+            raw_reward_scale: float = 0.1) -> None:
 
+        if reward_mode not in ('legacy', 'raw', 'normalized'):
+            raise ValueError('reward_mode must be legacy, raw or normalized')
+        if not np.isfinite(raw_reward_scale) or raw_reward_scale <= 0:
+            raise ValueError('raw_reward_scale must be finite and positive')
+        self.reward_mode = reward_mode
+        self.raw_reward_scale = raw_reward_scale
         self.device = device
         self.discount_factor = discount_factor
         self.gae_coeff = gae_coeff
@@ -95,6 +103,18 @@ class ReplayBuffer:
     # Private Methods
     #################
 
+    def _transform_rewards(self, rewards, stages, stage_completes, reward_rms):
+        # Opt-in event-reward experiment: preserve signs and do not amplify an
+        # already one-shot stage-transition bonus by 1 / (1 - gamma).
+        if self.reward_mode == 'raw':
+            return rewards * self.raw_reward_scale
+        normalized = reward_rms.normalize(rewards, stages, default_mean=0.1, default_std=0.1)
+        # Event progress already measures incremental rotation. Do not boost
+        # the last airborne sample merely because the stage changes.
+        if self.reward_mode == 'normalized':
+            return normalized
+        return normalized + normalized * stage_completes * self.discount_factor / (1.0 - self.discount_factor)
+
     def _processBatches(self, obs_rms, state_rms, reward_rms, actor, reward_critic, cost_critic, start_idx, end_idx):
         obs_tensor = self.obs[start_idx:end_idx, :, :]
         states_tensor = self.states[start_idx:end_idx, :, :]
@@ -118,11 +138,7 @@ class ReplayBuffer:
         norm_states_tensor = state_rms.normalize(states_tensor)
         norm_next_obs_tensor = obs_rms.normalize(next_obs_tensor)
         norm_next_states_tensor = state_rms.normalize(next_states_tensor)
-        norm_reward_std = 0.1
-        norm_reward_mean = 0.1
-        norm_rewards_tensor = reward_rms.normalize(
-            rewards_tensor, stages_tensor, default_mean=norm_reward_mean, default_std=norm_reward_std)
-        norm_rewards_tensor += norm_rewards_tensor*stage_completes_tensor*self.discount_factor/(1.0 - self.discount_factor)
+        norm_rewards_tensor = self._transform_rewards(rewards_tensor, stages_tensor, stage_completes_tensor, reward_rms)
         norm_costs_tensor = fails_tensor.unsqueeze(-1)*costs_tensor/(1.0 - self.discount_factor) \
                         + (1.0 - fails_tensor.unsqueeze(-1))*costs_tensor
 

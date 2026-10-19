@@ -1,0 +1,10 @@
+# Direct dependencies from the local Python 3.8 environment.
+# Install Isaac Gym Preview 4 and IsaacGymEnvs separately; see README.md.
+torch==1.12.1
+numpy==1.21.5
+ruamel.yaml==0.17.32
+requests==2.28.1
+pandas==1.4.4
+scipy==1.10.1
+wandb==0.15.12
+gym==0.23.1

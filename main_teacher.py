@@ -18,6 +18,7 @@ import argparse
 import torch
 import wandb
 import time
+from pathlib import Path
 
 def getParser():
     parser = argparse.ArgumentParser()
@@ -28,6 +29,13 @@ def getParser():
     parser.add_argument('--device_type', type=str, default='gpu', help='gpu or cpu.')
     parser.add_argument('--gpu_idx', type=int, default=0, help='GPU index.')
     parser.add_argument('--model_num', type=int, default=0, help='num model.')
+    parser.add_argument('--init_from', type=str, default=None,
+                        help='Warm-start from this result directory and save to a NEW seed; step count restarts at zero.')
+    parser.add_argument('--total_steps', type=int, default=None, help='Override the training step budget in task YAML.')
+    parser.add_argument('--reset_reward_stats', action='store_true', help='Warm-start only: relearn reward normalization after changing rewards.')
+    parser.add_argument('--reset_critics', action='store_true', help='Warm-start only: initialize value networks for a changed reward/task.')
+    parser.add_argument('--reset_optimizers', action='store_true', help='Warm-start only: discard old optimizer moments and restore configured learning rates.')
+    parser.add_argument('--console_freq', type=int, default=100000, help='Training steps between local progress reports; 0 disables.')
     parser.add_argument('--save_freq', type=int, default=int(1e7), help='# of time steps for save.')
     parser.add_argument('--wandb_freq', type=int, default=int(5e4), help='# of time steps for wandb logging.')
     parser.add_argument('--slack_freq', type=int, default=int(2.5e6), help='# of time steps for slack message.')
@@ -39,15 +47,51 @@ def getParser():
     parser.add_argument('--comment', type=str, default=None, help='wandb comment saved in run name.')
     return parser
 
+def require_checkpoint(save_dir, model_num):
+    """Never silently play or resume randomly initialized weights."""
+    root = Path(save_dir)
+    required = [root / 'checkpoint' / f'model_{model_num}.pt']
+    required += [root / f'{name}_scale' / f'{model_num}.pkl' for name in ('obs', 'state', 'reward')]
+    missing = [str(p) for p in required if not p.is_file()]
+    if missing:
+        raise FileNotFoundError('Missing checkpoint/normalization files: ' + ', '.join(missing))
+
 def train(args, task_cfg, algo_cfg):
+    if algo_cfg.get('model', {}).get('actor', {}).get('freeze_ground', False) and not (args.init_from or args.model_num):
+        raise ValueError('freeze_ground requires --init_from or --model_num; do not freeze a randomly initialized ground policy.')
+    if (args.reset_critics or args.reset_optimizers) and not args.init_from:
+        raise ValueError('Critic/optimizer resets require --init_from; ordinary resume must preserve training state.')
+    if args.reset_reward_stats and not args.init_from:
+        raise ValueError('--reset_reward_stats requires --init_from; do not reset statistics on ordinary resume.')
+    if args.total_steps is not None:
+        task_cfg['n_total_steps'] = args.total_steps
+    if task_cfg['n_total_steps'] <= 0 or task_cfg['n_total_steps'] % algo_cfg['n_steps']:
+        raise ValueError('total_steps must be positive and divisible by algo n_steps.')
+    if task_cfg['env']['num_envs'] <= 0 or algo_cfg['n_steps'] % task_cfg['env']['num_envs']:
+        raise ValueError('algo n_steps must be divisible by num_envs; e.g. 10000 / 500.')
+    if args.init_from:
+        require_checkpoint(args.init_from, args.model_num)
+        if Path(args.save_dir).exists():
+            raise ValueError('Warm-start requires an unused destination seed to preserve existing results.')
+    elif args.model_num:
+        require_checkpoint(args.save_dir, args.model_num)
+        if args.model_num >= task_cfg['n_total_steps']:
+            raise ValueError('To resume, total_steps must exceed model_num; it is the cumulative target, not extra steps.')
+    elif any((Path(args.save_dir) / 'checkpoint').glob('model_*.pt')):
+        raise ValueError('This seed already has checkpoints. Use --model_num to resume or choose an unused seed.')
     # set seed
     setSeed(args.seed)
+    task_cfg['env']['history_len'] = algo_cfg['history_len']
 
     # backup configurations
     backupFiles(f"{args.save_dir}/backup", task_cfg['backup_files'], algo_cfg['backup_files'])
+    # Record overrides as well as source files, so short runs are reproducible.
+    with open(f'{args.save_dir}/backup/effective_task.yaml', 'w') as f:
+        YAML().dump(task_cfg, f)
+    with open(f'{args.save_dir}/backup/run.yaml', 'w') as f:
+        YAML().dump(vars(args), f)
 
     # create environments
-    task_cfg['env']['history_len'] = algo_cfg['history_len']
     env_fn = lambda: task_dict[task_cfg['name']](
         cfg=task_cfg, rl_device=args.device_name, sim_device=args.device_name, 
         graphics_device_id=0, headless=(not args.render), 
@@ -83,7 +127,31 @@ def train(args, task_cfg, algo_cfg):
     for key in algo_cfg.keys():
         agent_args.__dict__[key] = algo_cfg[key]
     agent = algo_dict[args.algo_name.lower()](agent_args)
-    initial_step = agent.load(args.model_num)
+    if args.init_from:
+        destination = agent.save_dir
+        agent.save_dir = args.init_from
+        agent.load(args.model_num)
+        if args.reset_reward_stats:
+            agent.reward_rms.mean.zero_()
+            agent.reward_rms.var.fill_(1)
+            agent.reward_rms.count.zero_()
+        if args.reset_critics:
+            agent.reward_critic.initialize()
+            agent.cost_critic.initialize()
+            agent.reward_critic_optimizer = torch.optim.Adam(agent.reward_critic.parameters(), lr=agent.critic_lr)
+            agent.cost_critic_optimizer = torch.optim.Adam(agent.cost_critic.parameters(), lr=agent.critic_lr)
+        if args.reset_optimizers:
+            agent.actor_lr = float(algo_cfg['actor_lr'])
+            agent.critic_lr = float(algo_cfg['critic_lr'])
+            agent.actor_optimizer = torch.optim.Adam((p for p in agent.actor.parameters() if p.requires_grad), lr=agent.actor_lr)
+            agent.reward_critic_optimizer = torch.optim.Adam(agent.reward_critic.parameters(), lr=agent.critic_lr)
+            agent.cost_critic_optimizer = torch.optim.Adam(agent.cost_critic.parameters(), lr=agent.critic_lr)
+        agent.save_dir = destination
+        Path(destination, 'checkpoint').mkdir(parents=True, exist_ok=True)
+        initial_step = 0
+        print(f'[train] warm-start: {args.init_from}/checkpoint/model_{args.model_num}.pt -> {destination}', flush=True)
+    else:
+        initial_step = agent.load(args.model_num)
 
     # wandb
     if args.wandb:
@@ -114,6 +182,12 @@ def train(args, task_cfg, algo_cfg):
     wandb_step = initial_step
     slack_step = initial_step
     save_step = initial_step
+    console_step = initial_step
+    console_started = time.time()
+    stage_counts = torch.zeros(args.num_stages, device=args.device)
+    episode_count = 0
+    failure_count = 0
+    full_turn_count = landing_success_count = 0
 
     # initialize environments
     with torch.no_grad():
@@ -131,6 +205,7 @@ def train(args, task_cfg, algo_cfg):
 
             # ======= collect trajectories & training ======= #
             with torch.no_grad():
+                stage_counts += stages_tensor.sum(dim=0)
                 actions_tensor = agent.getAction(obs_tensor, states_tensor, stages_tensor, False)
                 obs_tensor, states_tensor, rewards_tensor, dones, infos = vec_env.step(actions_tensor)
                 stages_tensor = states_tensor[:, -args.num_stages:]
@@ -145,6 +220,12 @@ def train(args, task_cfg, algo_cfg):
             reward_sums_tensor += rewards_tensor
             cost_sums_tensor += costs_tensor
             fail_sums_tensor += fails_tensor
+            episode_count += int(dones_tensor.sum())
+            failure_count += int(fails_tensor.sum())
+            if 'one_turn' in infos:
+                full_turn_count += int((infos['one_turn'].bool() & dones_tensor.bool()).sum())
+                landing_success_count += int((infos['landing_success'].bool() & dones_tensor.bool()
+                                              & ~fails_tensor.bool()).sum())
 
             agent.step(rewards_tensor, costs_tensor, dones_tensor, fails_tensor, 
                        next_obs_tensor, next_states_tensor, next_stages_tensor)
@@ -220,6 +301,18 @@ def train(args, task_cfg, algo_cfg):
         fps = args.n_steps/(end_time - start_time)
         if 'fps' in logger.log_name_list:
             logger.write('fps', [args.n_steps, fps])
+        if args.console_freq > 0 and total_step - console_step >= args.console_freq:
+            fractions = (stage_counts / stage_counts.sum().clamp_min(1)).tolist()
+            stages_text = ' '.join(f'{name}={value:.1%}' for name, value in zip(task_cfg['env']['stage_names'], fractions))
+            print(f'[train] steps={total_step}/{args.n_total_steps} {stages_text} '
+                  f'episodes={episode_count} failures={failure_count} '
+                  f'full_turns={full_turn_count} stable_landings={landing_success_count} '
+                  f'fps={(total_step-console_step)/(time.time()-console_started):.0f}', flush=True)
+            console_step = total_step
+            console_started = time.time()
+            stage_counts.zero_()
+            episode_count = failure_count = 0
+            full_turn_count = landing_success_count = 0
 
     # final save
     agent.save(total_step)
@@ -230,6 +323,7 @@ def train(args, task_cfg, algo_cfg):
 
 
 def test(args, task_cfg, algo_cfg):
+    require_checkpoint(args.save_dir, args.model_num)
     # create environments
     task_cfg['env']['num_envs'] = 1
     if 'randomize' in task_cfg['env']:

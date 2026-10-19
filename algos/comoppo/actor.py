@@ -4,6 +4,7 @@ from algos.common.actor_base import (
 )
 
 from typing import Tuple
+from copy import deepcopy
 import numpy as np
 import torch
 
@@ -46,6 +47,37 @@ class Actor(ActorBase):
 
         # build model
         self.build()
+        self.freeze_ground = bool(actor_cfg.get('freeze_ground', False))
+        self.jump_residual_limit = float(actor_cfg.get('jump_residual_limit', 0.0))
+        if not np.isfinite(self.jump_residual_limit) or self.jump_residual_limit < 0:
+            raise ValueError('jump_residual_limit must be finite and nonnegative.')
+        if self.jump_residual_limit and not self.freeze_ground:
+            raise ValueError('Bounded jump adjustment requires freeze_ground.')
+        if self.freeze_ground:
+            if not self.log_std_fix:
+                raise ValueError('freeze_ground requires fixed action standard deviation.')
+            self.ground_model = deepcopy(self.model).requires_grad_(False)
+            self.ground_mean_decoder = deepcopy(self.mean_decoder).requires_grad_(False)
+        if self.jump_residual_limit:
+            self.jump_reference_model = deepcopy(self.model).requires_grad_(False)
+            self.jump_reference_mean_decoder = deepcopy(self.mean_decoder).requires_grad_(False)
+
+    def load_state_dict(self, state_dict, strict=True):
+        legacy = self.freeze_ground and not any(k.startswith('ground_') for k in state_dict)
+        new_jump = self.jump_residual_limit > 0 and not any(k.startswith('jump_reference_') for k in state_dict)
+        result = super().load_state_dict(state_dict, strict=False if legacy or new_jump else strict)
+        if legacy or new_jump:
+            allowed = (('ground_',) if legacy else ()) + (('jump_reference_',) if new_jump else ())
+            unexpected_missing = [k for k in result.missing_keys if not k.startswith(allowed)]
+            if unexpected_missing or result.unexpected_keys:
+                raise RuntimeError('Incompatible actor checkpoint: '+str(result))
+        if legacy:
+            self.ground_model.load_state_dict(self.model.state_dict())
+            self.ground_mean_decoder.load_state_dict(self.mean_decoder.state_dict())
+        if new_jump:
+            self.jump_reference_model.load_state_dict(self.model.state_dict())
+            self.jump_reference_mean_decoder.load_state_dict(self.mean_decoder.state_dict())
+        return result
 
 
     def build(self) -> None:
@@ -74,6 +106,20 @@ class Actor(ActorBase):
         '''
         x = self.model(torch.cat([obs, state, phase], dim=-1))
         mean = self.last_activation(self.mean_decoder(x))
+        if self.freeze_ground:
+            with torch.no_grad():
+                ground_mean = self.last_activation(self.ground_mean_decoder(
+                    self.ground_model(torch.cat([obs, state, phase], dim=-1))))
+            if self.jump_residual_limit:
+                with torch.no_grad():
+                    reference_mean = self.last_activation(self.jump_reference_mean_decoder(
+                        self.jump_reference_model(torch.cat([obs, state, phase], dim=-1))))
+                jump_mean = ground_mean + self.jump_residual_limit*torch.tanh((mean-reference_mean)/self.jump_residual_limit)
+                mean = torch.where((phase[..., 2] > .5).unsqueeze(-1), jump_mean, mean)
+                frozen_stage_count = 2
+            else:
+                frozen_stage_count = 3
+            mean = torch.where((phase[..., :frozen_stage_count].sum(-1) > .5).unsqueeze(-1), ground_mean, mean)
         log_std = self.std_decoder(x)
         log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
         std = torch.exp(log_std)
@@ -118,8 +164,16 @@ class Actor(ActorBase):
 
     def initialize(self) -> None:
         for name, module in self.named_children():
+            if name.startswith(('ground_', 'jump_reference_')):
+                continue
             if name == 'std_decoder':
                 initializer = lambda m: initWeights(m, init_bias=self.log_std_init)
             else:
                 initializer = lambda m: initWeights(m)
             module.apply(initializer)
+        if self.freeze_ground:
+            self.ground_model.load_state_dict(self.model.state_dict())
+            self.ground_mean_decoder.load_state_dict(self.mean_decoder.state_dict())
+        if self.jump_residual_limit:
+            self.jump_reference_model.load_state_dict(self.model.state_dict())
+            self.jump_reference_mean_decoder.load_state_dict(self.mean_decoder.state_dict())

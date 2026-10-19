@@ -74,6 +74,8 @@ class Agent(AgentBase):
 
         # declare actor and critic
         model_cfg = args.model
+        if model_cfg['actor'].get('freeze_ground', False) and self.norm_obs:
+            raise ValueError('freeze_ground requires norm_obs:false to preserve the source observation normalization.')
         self.actor = Actor(
             self.device, self.obs_dim, self.state_dim, self.stage_dim, self.action_dim, 
             self.action_bound_min, self.action_bound_max, model_cfg['actor']).to(self.device)
@@ -85,7 +87,7 @@ class Agent(AgentBase):
             self.cost_dim, model_cfg['cost_critic']).to(self.device)
 
         # declare optimizers
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=self.actor_lr)
+        self.actor_optimizer = torch.optim.Adam((p for p in self.actor.parameters() if p.requires_grad), lr=self.actor_lr)
         self.reward_critic_optimizer = torch.optim.Adam(self.reward_critic.parameters(), lr=self.critic_lr)
         self.cost_critic_optimizer = torch.optim.Adam(self.cost_critic.parameters(), lr=self.critic_lr)
 
@@ -93,7 +95,9 @@ class Agent(AgentBase):
         self.replay_buffer = ReplayBuffer(
             self.device, self.discount_factor, self.gae_coeff, self.n_envs, self.n_steps, 
             self.obs_dim, self.state_dim, self.stage_dim, self.action_dim, 
-            self.reward_dim, self.cost_dim, self.obs_sym_mat, self.state_sym_mat)
+            self.reward_dim, self.cost_dim, self.obs_sym_mat, self.state_sym_mat,
+            reward_mode=getattr(args, 'reward_mode', 'legacy'),
+            raw_reward_scale=getattr(args, 'raw_reward_scale', 0.1))
 
     ################
     # Public Methods
@@ -280,6 +284,8 @@ class Agent(AgentBase):
             self.reward_critic.load_state_dict(checkpoint['reward_critic'])
             self.cost_critic.load_state_dict(checkpoint['cost_critic'])
             self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
+            # Resume adaptive LR consistently across unattended milestones.
+            self.actor_lr = self.actor_optimizer.param_groups[0]['lr']
             self.reward_critic_optimizer.load_state_dict(checkpoint['reward_critic_optimizer'])
             self.cost_critic_optimizer.load_state_dict(checkpoint['cost_critic_optimizer'])
             cprint(f'[{self.name}] load success.', bold=True, color="blue")
@@ -288,7 +294,12 @@ class Agent(AgentBase):
             self.actor.initialize()
             self.reward_critic.initialize()
             self.cost_critic.initialize()
-            cprint(f'[{self.name}] load fail.', bold=True, color="red")
+            cprint(
+                f'[{self.name}] checkpoint model_{model_num}.pt not found; '
+                'starting a new training run.',
+                bold=True,
+                color="yellow",
+            )
             return 0
 
     ################

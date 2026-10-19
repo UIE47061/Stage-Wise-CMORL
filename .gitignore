@@ -1,14 +1,35 @@
+# Python environments and caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.ipynb_checkpoints/
 *.ipynb
-*.pkl
-*.pt
-*.pyc
-*.png
-*.sh
-.env
-args.txt
 
-__pycache__
-wandb
-model
-results
-.vscode
+# Training outputs and model/normalization checkpoints
+/results/
+/runs/
+wandb/
+model/
+*.pt
+*.pth
+*.pkl
+*.onnx
+*.log
+
+# Local credentials and editor settings
+.env
+.env.*
+!.env.example
+args.txt
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo

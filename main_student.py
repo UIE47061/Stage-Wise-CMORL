@@ -19,6 +19,8 @@ import torch
 import wandb
 import time
 import glob
+from pathlib import Path
+from utils.student_rollout import student_probability
 
 def getParser():
     parser = argparse.ArgumentParser()
@@ -26,9 +28,11 @@ def getParser():
     parser.add_argument('--wandb', action='store_true', help='use wandb?')
     parser.add_argument('--slack', action='store_true', help='use slack?')
     parser.add_argument('--test', action='store_true', help='test or train?')
+    parser.add_argument('--randomized_test', action='store_true', help='Keep task domain randomization enabled during test.')
     parser.add_argument('--device_type', type=str, default='gpu', help='gpu or cpu.')
     parser.add_argument('--gpu_idx', type=int, default=0, help='GPU index.')
     parser.add_argument('--model_num', type=int, default=0, help='num model.')
+    parser.add_argument('--total_steps', type=int, default=None, help='Cumulative student training steps.')
     parser.add_argument('--save_freq', type=int, default=int(1e7), help='# of time steps for save.')
     parser.add_argument('--wandb_freq', type=int, default=int(5e4), help='# of time steps for wandb logging.')
     parser.add_argument('--slack_freq', type=int, default=int(2.5e6), help='# of time steps for slack message.')
@@ -46,6 +50,10 @@ def train(args, task_cfg, algo_cfg):
 
     # backup configurations
     backupFiles(f"{args.save_dir}/backup", task_cfg['backup_files'], algo_cfg['backup_files'])
+    with open(f'{args.save_dir}/backup/effective_task.yaml', 'w') as f:
+        YAML().dump(task_cfg, f)
+    with open(f'{args.save_dir}/backup/run.yaml', 'w') as f:
+        YAML().dump(vars(args), f)
 
     # create environments
     env_fn = lambda: task_dict[task_cfg['name']](
@@ -54,6 +62,7 @@ def train(args, task_cfg, algo_cfg):
         virtual_screen_capture=False, force_render=args.render
     )
     vec_env = EnvWrapper(env_fn)
+    print(f'[student] training randomized={vec_env.unwrapped.is_randomized}', flush=True)
 
     # set arguments
     args.device = vec_env.unwrapped.rl_device
@@ -84,6 +93,9 @@ def train(args, task_cfg, algo_cfg):
         agent_args.__dict__[key] = algo_cfg[key]
     agent = algo_dict[args.algo_name.lower()](agent_args)
     initial_step = agent.load(args.model_num)
+    if initial_step and algo_cfg.get('reset_actor_lr_on_resume', False):
+        for group in agent.actor_optimizer.param_groups:
+            group['lr'] = agent_args.actor_lr
 
     # declare teacher
     teacher_args = deepcopy(args)
@@ -101,7 +113,8 @@ def train(args, task_cfg, algo_cfg):
     teacher_agent = algo_dict[teacher_args.algo_name.lower()](teacher_args)
     assert teacher_agent.load(teacher_args.model_num) != 0
     # copy teacher's obs_rms to student
-    agent.copyObsRMS(teacher_agent.obs_rms)
+    if initial_step == 0:
+        agent.copyObsRMS(teacher_agent.obs_rms)
 
     # wandb
     if args.wandb:
@@ -132,6 +145,11 @@ def train(args, task_cfg, algo_cfg):
     wandb_step = initial_step
     slack_step = initial_step
     save_step = initial_step
+    rollout_cfg = algo_cfg.get('student_rollout')
+    window_episodes = window_failures = 0
+    student_mask = torch.zeros(args.n_envs, dtype=torch.bool, device=args.device)
+    if rollout_cfg is not None:
+        student_mask = torch.rand(args.n_envs, device=args.device) < student_probability(initial_step, rollout_cfg)
 
     # initialize environments
     with torch.no_grad():
@@ -153,7 +171,10 @@ def train(args, task_cfg, algo_cfg):
                 student_actions_tensor = agent.getAction(obs_tensor, True)
                 agent.step(obs_tensor.clone(), teacher_actions_tensor.clone())
 
-                if ((total_step//int(1e5)) % 2 == 0) or (total_step < 1e7):
+                if rollout_cfg is not None:
+                    # One controller per episode; teacher labels every visited state.
+                    actions_tensor = torch.where(student_mask[:, None], student_actions_tensor, teacher_actions_tensor)
+                elif ((total_step//int(1e5)) % 2 == 0) or (total_step < 1e7):
                     actions_tensor = teacher_actions_tensor
                 else:
                     actions_tensor = student_actions_tensor
@@ -162,6 +183,14 @@ def train(args, task_cfg, algo_cfg):
                 states_tensor = states_tensor[:, :-args.num_stages]
                 costs_tensor = infos['costs']
                 fails_tensor = infos['fails']
+                if not (torch.isfinite(obs_tensor).all() and torch.isfinite(actions_tensor).all()
+                        and torch.isfinite(teacher_actions_tensor).all()):
+                    raise RuntimeError('Non-finite student rollout or teacher labels')
+                window_episodes += int(infos['dones'].sum())
+                window_failures += int(fails_tensor.sum())
+                if rollout_cfg is not None:
+                    next_mask = torch.rand(args.n_envs, device=args.device) < student_probability(total_step, rollout_cfg)
+                    student_mask = torch.where(infos['dones'].bool(), next_mask, student_mask)
 
             reward_sums_tensor += rewards_tensor
             cost_sums_tensor += costs_tensor
@@ -223,6 +252,14 @@ def train(args, task_cfg, algo_cfg):
         # train
         if agent.readyToTrain():
             train_results = agent.train()
+            if total_step % 100000 == 0:
+                probability = student_probability(total_step, rollout_cfg) if rollout_cfg is not None else -1
+                print(f'[student] steps={total_step}/{args.n_total_steps} loss={train_results["actor_loss"]:.6f} '
+                      f'new_episode_student_probability={probability:.3f} '
+                      f'mixed_rollout_episodes={window_episodes} failures={window_failures}', flush=True)
+                window_episodes = window_failures = 0
+            if not np.isfinite(train_results['actor_loss']):
+                raise RuntimeError('Non-finite student training loss')
             for log_name in train_results.keys():
                 if log_name in agent_args.logging['task_indep']:
                     logger.write(log_name, [args.n_steps, train_results[log_name]])
@@ -250,7 +287,7 @@ def train(args, task_cfg, algo_cfg):
 def test(args, task_cfg, algo_cfg):
     # create environments
     task_cfg['env']['num_envs'] = 1
-    if 'randomize' in task_cfg['env']:
+    if 'randomize' in task_cfg['env'] and not args.randomized_test:
         task_cfg['env']['randomize']['is_randomized'] = False
     env_fn = lambda: task_dict[task_cfg['name']](
         cfg=task_cfg, rl_device=args.device_name, sim_device=args.device_name, 
@@ -330,6 +367,27 @@ if __name__ == "__main__":
     args.name = f"{(args.task_name.lower())}_{(args.algo_name.lower())}"
     # save_dir
     args.save_dir = f"results/{args.name}/seed_{args.seed}"
+    if args.total_steps is not None:
+        task_cfg['n_total_steps'] = args.total_steps
+    if algo_cfg.get('student_rollout') is not None:
+        student_probability(0, algo_cfg['student_rollout'])
+    if args.model_num or args.test:
+        required = [Path(args.save_dir)/'checkpoint'/f'model_{args.model_num}.pt',
+                    Path(args.save_dir)/'obs_scale'/f'{args.model_num}.pkl']
+        missing = [str(p) for p in required if not p.is_file()]
+        if missing:
+            raise FileNotFoundError('Missing student files: '+', '.join(missing))
+    if not args.test:
+        if not args.model_num and list((Path(args.save_dir)/'checkpoint').glob('model_*.pt')):
+            raise ValueError('Student seed already exists; resume with --model_num or choose a new seed.')
+        if task_cfg['n_total_steps'] <= args.model_num or task_cfg['n_total_steps'] % algo_cfg['n_steps']:
+            raise ValueError('total_steps must exceed model_num and be divisible by n_steps.')
+        teacher = algo_cfg['teacher']
+        teacher_dir = Path(f"results/{args.task_name.lower()}_{teacher['algo_name'].lower()}/seed_{teacher['seed']}")
+        for folder, filename in [('checkpoint', f"model_{teacher['model_num']}.pt"),
+                                 *[(name, f"{teacher['model_num']}.pkl") for name in ['obs_scale', 'state_scale', 'reward_scale']]]:
+            if not (teacher_dir/folder/filename).is_file():
+                raise FileNotFoundError(str(teacher_dir/folder/filename))
     # device
     if torch.cuda.is_available() and args.device_type == 'gpu':
         device_name = f'cuda:{args.gpu_idx}'
